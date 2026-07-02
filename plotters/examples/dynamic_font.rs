@@ -29,7 +29,6 @@
 
 use plotters::prelude::*;
 use std::error::Error;
-use std::sync::Arc;
 
 const ROBOTO_REGULAR: &[u8] = include_bytes!("fonts/Roboto-Regular.ttf");
 const ROBOTO_BOLD: &[u8] = include_bytes!("fonts/Roboto-Bold.ttf");
@@ -41,9 +40,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let root = BitMapBackend::new(OUT_FILE_NAME, (640, 480))
         .into_drawing_area()
         .with_fonts([
-            ("Roboto", FontStyle::Normal, Arc::<[u8]>::from(ROBOTO_REGULAR)),
-            ("Roboto", FontStyle::Bold, Arc::<[u8]>::from(ROBOTO_BOLD)),
-            ("Kablammo", FontStyle::Normal, Arc::<[u8]>::from(KABLAMMO_REGULAR)),
+            ("Roboto", FontStyle::Normal, ROBOTO_REGULAR),
+            ("Roboto", FontStyle::Bold, ROBOTO_BOLD),
+            ("Kablammo", FontStyle::Normal, KABLAMMO_REGULAR),
         ]);
     root.fill(&WHITE)?;
 

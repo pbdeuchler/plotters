@@ -20,7 +20,28 @@ mod migration;
 #[cfg(not(all(target_arch = "wasm32", not(target_os = "wasi"))))]
 mod system;
 
-#[cfg(not(all(target_arch = "wasm32", not(target_os = "wasi"))))]
+// On wasm the browser owns font resolution, but keeping a no-op FontContext
+// lets DrawingArea and friends handle fonts uniformly instead of cfg-gating
+// every field and call site.
+#[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+mod context {
+    use std::sync::Arc;
+
+    pub(crate) struct FontContext;
+
+    impl FontContext {
+        pub(crate) fn system_default() -> Arc<FontContext> {
+            Arc::new(FontContext)
+        }
+    }
+
+    pub(crate) struct FontContextGuard;
+
+    pub(crate) fn push_font_context(_ctx: Arc<FontContext>) -> FontContextGuard {
+        FontContextGuard
+    }
+}
+
 pub(crate) use context::{push_font_context, FontContext};
 #[cfg(not(all(target_arch = "wasm32", not(target_os = "wasi"))))]
 pub use engine::FontError;

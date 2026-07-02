@@ -139,7 +139,8 @@ mod test {
 
     #[cfg(feature = "ab_glyph")]
     fn register_test_serif() {
-        const FONT_BYTES: &[u8] = include_bytes!("../../tests/fixtures/SourceSansPro-Regular-Tiny.ttf");
+        const FONT_BYTES: &[u8] =
+            include_bytes!("../../tests/fixtures/SourceSansPro-Regular-Tiny.ttf");
         let _ = crate::style::register_font("serif", crate::style::FontStyle::Normal, FONT_BYTES);
         let _ =
             crate::style::register_font("sans-serif", crate::style::FontStyle::Normal, FONT_BYTES);

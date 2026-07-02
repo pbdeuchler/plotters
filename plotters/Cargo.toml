@@ -4,7 +4,7 @@ version = "0.3.7"
 authors = ["Hao Hou <haohou302@gmail.com>"]
 edition = "2018"
 license = "MIT"
-msrv = "1.88"
+rust-version = "1.88"
 description = "A Rust drawing library focus on data plotting for both WASM and native applications"
 repository = "https://github.com/plotters-rs/plotters"
 homepage = "https://plotters-rs.github.io/"
@@ -40,7 +40,6 @@ path = "../plotters-svg"
 [target.'cfg(not(all(target_arch = "wasm32", not(target_os = "wasi"))))'.dependencies]
 fontique = "0.9.0"
 harfrust = "0.6.0"
-once_cell = "1.8.0"
 skrifa = "0.42.1"
 zeno = "0.3.3"
 

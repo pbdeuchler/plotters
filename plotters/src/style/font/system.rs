@@ -1,6 +1,6 @@
 use fontique::{
-    Attributes, Collection, CollectionOptions, FallbackKey, FontStyle as FontiqueStyle,
-    FontWeight, FontWidth, GenericFamily, QueryFamily, QueryStatus, Script, SourceCache,
+    Attributes, Collection, CollectionOptions, FallbackKey, FontStyle as FontiqueStyle, FontWeight,
+    FontWidth, GenericFamily, QueryFamily, QueryStatus, Script, SourceCache,
 };
 use plotters_backend::{FontFamily, FontStyle};
 use std::sync::Arc;

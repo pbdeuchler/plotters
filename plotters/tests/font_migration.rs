@@ -5,7 +5,6 @@
 
 use plotters::coord::Shift;
 use plotters::prelude::*;
-use std::sync::Arc;
 use std::thread;
 
 static FONT_BYTES: &[u8] = include_bytes!("fixtures/SourceSansPro-Regular-Tiny.ttf");
@@ -16,16 +15,12 @@ fn buffer() -> Vec<u8> {
     vec![255; (CANVAS.0 * CANVAS.1 * 3) as usize]
 }
 
-fn font_bytes() -> Arc<[u8]> {
-    Arc::<[u8]>::from(FONT_BYTES)
-}
-
 fn root<'a>(buffer: &'a mut [u8]) -> DrawingArea<BitMapBackend<'a>, Shift> {
     BitMapBackend::with_buffer(buffer, CANVAS).into_drawing_area()
 }
 
-fn font_table(name: &'static str) -> Vec<(&'static str, FontStyle, Arc<[u8]>)> {
-    vec![(name, FontStyle::Normal, font_bytes())]
+fn font_table(name: &'static str) -> Vec<(&'static str, FontStyle, &'static [u8])> {
+    vec![(name, FontStyle::Normal, FONT_BYTES)]
 }
 
 fn style(name: &'static str) -> TextStyle<'static> {
@@ -110,7 +105,25 @@ fn sub_areas_inherit_parent_context() {
 }
 
 #[test]
-fn sub_area_context_override_stays_local() {
+fn chained_with_fonts_accumulates() {
+    const FIRST: &str = "PlottersFixtureChainedFirst";
+    const SECOND: &str = "PlottersFixtureChainedSecond";
+
+    let mut pixels = buffer();
+    {
+        let area = root(&mut pixels)
+            .with_fonts(font_table(FIRST))
+            .with_fonts(font_table(SECOND));
+
+        area.draw_text("First", &style(FIRST), (8, 8)).unwrap();
+        area.draw_text("Second", &style(SECOND), (8, 48)).unwrap();
+    }
+
+    assert_has_ink(&pixels);
+}
+
+#[test]
+fn sub_area_with_fonts_extends_parent_fonts() {
     const PARENT: &str = "PlottersFixtureParent";
     const CHILD: &str = "PlottersFixtureChild";
 
@@ -121,8 +134,11 @@ fn sub_area_context_override_stays_local() {
             .clone()
             .with_fonts(font_table(CHILD));
 
-        assert_text_missing(&child, PARENT);
+        // `with_fonts` is additive: the child sees the parent's fonts plus
+        // its own, while the parent never sees the child's addition.
         child.draw_text("Child", &style(CHILD), (8, 8)).unwrap();
+        child.draw_text("Parent", &style(PARENT), (8, 28)).unwrap();
+        assert_text_missing(&area, CHILD);
         area.draw_text("Parent", &style(PARENT), (8, 48)).unwrap();
     }
 

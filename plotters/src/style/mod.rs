@@ -18,7 +18,6 @@ pub use colors::{BLACK, BLUE, CYAN, GREEN, MAGENTA, RED, TRANSPARENT, WHITE, YEL
 #[cfg_attr(doc_cfg, doc(cfg(feature = "full_palette")))]
 pub use colors::full_palette;
 
-#[cfg(not(all(target_arch = "wasm32", not(target_os = "wasi"))))]
 pub(crate) use font::{push_font_context, FontContext};
 #[cfg(all(
     not(all(target_arch = "wasm32", not(target_os = "wasi"))),

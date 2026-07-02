@@ -1,57 +1,36 @@
 use super::context::{registered_font, RegisteredFont};
-use super::engine::{FontEngine, FontError};
-use super::harfrust_engine::HarfrustEngine;
-use once_cell::sync::Lazy;
+use super::engine::FontError;
+use super::harfrust_engine;
 use plotters_backend::FontStyle;
 use std::error::Error;
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
-static REGISTERED_FONTS: Lazy<Mutex<Vec<RegisteredFont>>> = Lazy::new(|| Mutex::new(Vec::new()));
+static REGISTERED_FONTS: LazyLock<Mutex<Vec<RegisteredFont>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+// Bumped on every registry mutation so per-context resolution memos know to
+// re-resolve instead of serving fonts cached before the registration.
+static REGISTRY_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn registry_generation() -> u64 {
+    REGISTRY_GENERATION.load(Ordering::Acquire)
+}
 
 /// Error returned when legacy font registration receives invalid font bytes.
 #[derive(Debug, Clone)]
-pub struct InvalidFont {
-    reason: InvalidFontReason,
-}
-
-#[derive(Debug, Clone)]
-enum InvalidFontReason {
-    Parse(FontError),
-    RegistryLock(String),
-}
-
-impl InvalidFont {
-    fn parse(err: FontError) -> Self {
-        Self {
-            reason: InvalidFontReason::Parse(err),
-        }
-    }
-
-    fn registry_lock(err: impl fmt::Display) -> Self {
-        Self {
-            reason: InvalidFontReason::RegistryLock(err.to_string()),
-        }
-    }
-}
+pub struct InvalidFont(FontError);
 
 impl fmt::Display for InvalidFont {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.reason {
-            InvalidFontReason::Parse(err) => write!(fmt, "failed to register font: {}", err),
-            InvalidFontReason::RegistryLock(err) => {
-                write!(fmt, "failed to lock registered font registry: {}", err)
-            }
-        }
+        write!(fmt, "failed to register font: {}", self.0)
     }
 }
 
 impl Error for InvalidFont {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match &self.reason {
-            InvalidFontReason::Parse(err) => Some(err),
-            InvalidFontReason::RegistryLock(_) => None,
-        }
+        Some(&self.0)
     }
 }
 
@@ -65,26 +44,30 @@ pub fn register_font(
     bytes: &'static [u8],
 ) -> Result<(), InvalidFont> {
     let data = Arc::<[u8]>::from(bytes);
-    HarfrustEngine
-        .parse(data.clone(), 0)
-        .map_err(InvalidFont::parse)?;
+    harfrust_engine::parse(data.clone(), 0).map_err(InvalidFont)?;
 
     REGISTERED_FONTS
         .lock()
-        .map_err(InvalidFont::registry_lock)?
+        .unwrap_or_else(PoisonError::into_inner)
         .push(registered_font(name, style, data));
+    REGISTRY_GENERATION.fetch_add(1, Ordering::Release);
     Ok(())
 }
 
-pub(crate) fn registered_fonts() -> Option<Vec<RegisteredFont>> {
-    REGISTERED_FONTS.lock().ok().map(|fonts| fonts.clone())
+pub(crate) fn registered_fonts() -> Vec<RegisteredFont> {
+    REGISTERED_FONTS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
 }
 
 #[cfg(test)]
 pub(crate) fn _reset_registry_for_tests() {
-    if let Ok(mut fonts) = REGISTERED_FONTS.lock() {
-        fonts.clear();
-    }
+    REGISTERED_FONTS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
+    REGISTRY_GENERATION.fetch_add(1, Ordering::Release);
 }
 
 #[cfg(test)]
@@ -97,5 +80,15 @@ mod tests {
 
         assert!(err.to_string().contains("failed to register font"));
         assert!(err.source().is_some());
+    }
+
+    #[test]
+    fn registration_bumps_generation() {
+        static FONT_BYTES: &[u8] =
+            include_bytes!("../../../tests/fixtures/SourceSansPro-Regular-Tiny.ttf");
+
+        let before = registry_generation();
+        register_font("GenerationFixture", FontStyle::Normal, FONT_BYTES).unwrap();
+        assert!(registry_generation() > before);
     }
 }

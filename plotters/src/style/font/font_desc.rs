@@ -147,12 +147,7 @@ impl<'a> FontDesc<'a> {
     pub fn layout_box(&self, text: &str) -> FontResult<((i32, i32), (i32, i32))> {
         #[cfg(not(all(target_arch = "wasm32", not(target_os = "wasi"))))]
         {
-            FontContext::current_or_default().layout_box(
-                self.family,
-                self.style,
-                self.size,
-                text,
-            )
+            FontContext::current_or_default().layout_box(self.family, self.style, self.size, text)
         }
 
         #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]

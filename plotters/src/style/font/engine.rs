@@ -1,29 +1,6 @@
 use super::LayoutBox;
 use std::error::Error;
 use std::fmt;
-use std::sync::Arc;
-
-/// Parses font bytes into a backend-specific font object.
-pub trait FontEngine: Send + Sync {
-    fn parse(&self, data: Arc<[u8]>, index: u32) -> Result<Arc<dyn ParsedFont>, FontError>;
-}
-
-/// A parsed font that can shape text and rasterize glyph masks.
-pub trait ParsedFont: Send + Sync {
-    fn shape(&self, text: &str, font_size_px: f32) -> Result<ShapedRun, FontError>;
-    /// Rasterize a single glyph at the requested pixel size.
-    ///
-    /// `subpixel_offset` carries the fractional offset of the glyph origin within
-    /// its target pixel cell, in `[0, 1)`. Implementations should fold it into
-    /// the rasterization so strokes that fall between integer pixel columns are
-    /// anti-aliased correctly instead of being rounded away.
-    fn rasterize(
-        &self,
-        glyph_id: u32,
-        font_size_px: f32,
-        subpixel_offset: Vector2F,
-    ) -> Result<CoverageMask, FontError>;
-}
 
 /// A two-dimensional vector in floating-point pixel coordinates.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -39,25 +16,25 @@ impl Vector2F {
 }
 
 /// A shaped single-line run.
-pub struct ShapedRun {
-    pub glyphs: Vec<PositionedGlyph>,
-    pub bounds: LayoutBox,
+pub(crate) struct ShapedRun {
+    pub(crate) glyphs: Vec<PositionedGlyph>,
+    pub(crate) bounds: LayoutBox,
 }
 
 /// A glyph positioned relative to the run origin.
-pub struct PositionedGlyph {
-    pub id: u32,
-    pub x: f32,
-    pub y: f32,
+pub(crate) struct PositionedGlyph {
+    pub(crate) id: u32,
+    pub(crate) x: f32,
+    pub(crate) y: f32,
 }
 
 /// A dense grayscale coverage mask.
-pub struct CoverageMask {
-    pub left: i32,
-    pub top: i32,
-    pub width: u32,
-    pub height: u32,
-    pub data: Vec<u8>,
+pub(crate) struct CoverageMask {
+    pub(crate) left: i32,
+    pub(crate) top: i32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) data: Vec<u8>,
 }
 
 /// The error type for the native font pipeline.
@@ -88,8 +65,6 @@ pub enum FontError {
     },
     /// A glyph outline could not be converted into a coverage mask.
     RasterizeError(String),
-    /// Internal font state could not be locked.
-    LockError,
 }
 
 impl fmt::Display for FontError {
@@ -107,7 +82,6 @@ impl fmt::Display for FontError {
                 write!(fmt, "font is unavailable: {} {}", family, style)
             }
             FontError::RasterizeError(err) => write!(fmt, "failed to rasterize glyph: {}", err),
-            FontError::LockError => write!(fmt, "failed to lock font state"),
         }
     }
 }

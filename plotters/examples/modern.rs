@@ -8,7 +8,6 @@
 
 use plotters::prelude::*;
 use plotters::style::text_anchor::{HPos, Pos, VPos};
-use std::sync::Arc;
 
 const ROBOTO_REGULAR: &[u8] = include_bytes!("fonts/Roboto-Regular.ttf");
 const ROBOTO_BOLD: &[u8] = include_bytes!("fonts/Roboto-Bold.ttf");
@@ -56,8 +55,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = BitMapBackend::new(OUT_FILE_NAME, (1280, 720))
         .into_drawing_area()
         .with_fonts([
-            (FONT, FontStyle::Normal, Arc::<[u8]>::from(ROBOTO_REGULAR)),
-            (FONT, FontStyle::Bold, Arc::<[u8]>::from(ROBOTO_BOLD)),
+            (FONT, FontStyle::Normal, ROBOTO_REGULAR),
+            (FONT, FontStyle::Bold, ROBOTO_BOLD),
         ]);
     root.fill(&BG)?;
 
@@ -118,10 +117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
 
     chart
-        .draw_series(LineSeries::new(
-            DATA.iter().copied(),
-            CYAN.stroke_width(2),
-        ))?
+        .draw_series(LineSeries::new(DATA.iter().copied(), CYAN.stroke_width(2)))?
         .label("Confirmed eval loss")
         .legend(|(x, y)| {
             EmptyElement::at((x + 12, y))

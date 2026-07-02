@@ -1,27 +1,25 @@
-use super::engine::{CoverageMask, FontEngine, FontError, ParsedFont, Vector2F};
-use super::harfrust_engine::HarfrustEngine;
+use super::engine::{CoverageMask, FontError, Vector2F};
+use super::harfrust_engine::{self, HarfrustFont};
 use super::system::SystemFontSource;
-use super::LayoutBox;
-use once_cell::sync::Lazy;
+use super::{FontResult, LayoutBox};
 use plotters_backend::{FontFamily, FontStyle};
 use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex, OnceLock};
-
-type FontResult<T> = Result<T, FontError>;
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError, Weak};
 
 #[cfg(feature = "ab_glyph")]
 const DEFAULT_ENABLE_SYSTEM: bool = false;
 #[cfg(not(feature = "ab_glyph"))]
 const DEFAULT_ENABLE_SYSTEM: bool = true;
 
-// Strong refs: parsed fonts intern for the process lifetime, so that repeated
-// resolves return the same `Arc<dyn ParsedFont>` and the glyph cache keyed by
-// `Arc::as_ptr` cannot suffer from heap address reuse.
-static GLOBAL_PARSED: Lazy<Mutex<HashMap<FontFingerprint, Arc<dyn ParsedFont>>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+// Deduplicates parse work (table caches, shape plans) for the same font bytes
+// across contexts. Entries are weak so fonts dropped by every context can be
+// reclaimed; the glyph cache is keyed by content fingerprint, so reclaiming
+// and re-parsing a font never invalidates cached masks.
+static GLOBAL_PARSED: LazyLock<Mutex<HashMap<FontFingerprint, Weak<HarfrustFont>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 thread_local! {
     static FONT_CTX_STACK: RefCell<Vec<Arc<FontContext>>> = const { RefCell::new(Vec::new()) };
@@ -31,8 +29,11 @@ thread_local! {
 /// `Arc<FontContext>`, so the struct holds the shared state directly rather
 /// than via an inner Arc.
 pub(crate) struct FontContext {
-    engine: Arc<dyn FontEngine>,
     system: Mutex<SystemFontSource>,
+    // (family, style) -> parsed font. This is the hot-path cache: it makes
+    // repeated text operations skip the fontique query, the font-blob copy,
+    // and the content fingerprint entirely.
+    resolved: Mutex<ResolvedCache>,
     glyphs: Mutex<HashMap<GlyphCacheKey, Arc<CoverageMask>>>,
     explicit: Vec<RegisteredFont>,
     enable_system: bool,
@@ -43,6 +44,20 @@ pub(crate) struct FontContext {
     // explicit `with_fonts(...)` contexts stay strict (asking for an
     // unregistered name is still a hard miss).
     fallback_unresolved_names: bool,
+}
+
+#[derive(Default)]
+struct ResolvedCache {
+    // Mirrors the legacy registry's generation at fill time; a mismatch means
+    // `register_font` ran since and every cached resolution may be stale.
+    generation: u64,
+    map: HashMap<(String, FontStyle), ResolvedFont>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ResolvedFont {
+    pub(crate) font: Arc<HarfrustFont>,
+    fingerprint: FontFingerprint,
 }
 
 pub(crate) enum FontDrawError<E> {
@@ -78,11 +93,17 @@ const SUBPIXEL_LEVELS: u32 = 4;
 
 #[derive(Hash, PartialEq, Eq)]
 struct GlyphCacheKey {
-    font_ptr: usize,
+    font: FontFingerprint,
     glyph_id: u32,
     size_bits: u32,
     sx_quantum: u8,
     sy_quantum: u8,
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    // Every mutex in this module guards a cache; a panic mid-update can at
+    // worst leave a valid-but-incomplete cache, so poisoning is recoverable.
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl FontContext {
@@ -109,8 +130,8 @@ impl FontContext {
     /// Creates a font context with default settings.
     pub(crate) fn new() -> Self {
         Self {
-            engine: Arc::new(HarfrustEngine),
             system: Mutex::new(SystemFontSource::new(DEFAULT_ENABLE_SYSTEM)),
+            resolved: Mutex::new(ResolvedCache::default()),
             glyphs: Mutex::new(HashMap::new()),
             explicit: Vec::new(),
             enable_system: DEFAULT_ENABLE_SYSTEM,
@@ -119,15 +140,26 @@ impl FontContext {
         }
     }
 
+    /// Returns a fresh strict context that starts from this context's
+    /// explicit font list, so chained `with_fonts` calls accumulate fonts.
+    /// Caches start empty; parsed fonts are shared via the global parse
+    /// cache, so nothing is re-parsed.
+    pub(crate) fn extended(&self) -> Self {
+        Self {
+            explicit: self.explicit.clone(),
+            ..Self::new()
+        }
+    }
+
     /// Adds a named font to this context.
     pub(crate) fn with_font(
         mut self,
-        name: &str,
+        name: impl Into<String>,
         style: FontStyle,
         bytes: impl Into<Arc<[u8]>>,
     ) -> Self {
         self.explicit.push(RegisteredFont {
-            family: name.to_owned(),
+            family: name.into(),
             style,
             data: bytes.into(),
             index: 0,
@@ -167,8 +199,8 @@ impl FontContext {
         size: f64,
         text: &str,
     ) -> FontResult<LayoutBox> {
-        let font = self.resolve(family, style)?;
-        Ok(font.shape(text, size as f32)?.bounds)
+        let resolved = self.resolve(family, style)?;
+        Ok(resolved.font.shape(text, size as f32)?.bounds)
     }
 
     pub(crate) fn draw<E, DrawFunc: FnMut(i32, i32, f32) -> Result<(), E>>(
@@ -180,14 +212,14 @@ impl FontContext {
         (base_x, base_y): (i32, i32),
         mut draw: DrawFunc,
     ) -> Result<(), FontDrawError<E>> {
-        let font = self.resolve(family, style)?;
-        let run = font.shape(text, size as f32)?;
+        let resolved = self.resolve(family, style)?;
+        let run = resolved.font.shape(text, size as f32)?;
 
         for glyph in run.glyphs {
             let (int_x, sx_quantum) = split_subpixel(glyph.x);
             let (int_y, sy_quantum) = split_subpixel(glyph.y);
             let mask =
-                self.rasterize_cached(&font, glyph.id, size as f32, sx_quantum, sy_quantum)?;
+                self.rasterize_cached(&resolved, glyph.id, size as f32, sx_quantum, sy_quantum)?;
             for row in 0..mask.height {
                 for col in 0..mask.width {
                     let index = (row * mask.width + col) as usize;
@@ -207,27 +239,21 @@ impl FontContext {
 
     fn rasterize_cached(
         &self,
-        font: &Arc<dyn ParsedFont>,
+        resolved: &ResolvedFont,
         glyph_id: u32,
         size_px: f32,
         sx_quantum: u8,
         sy_quantum: u8,
     ) -> FontResult<Arc<CoverageMask>> {
         let key = GlyphCacheKey {
-            font_ptr: Arc::as_ptr(font) as *const () as usize,
+            font: resolved.fingerprint,
             glyph_id,
             size_bits: size_px.to_bits(),
             sx_quantum,
             sy_quantum,
         };
 
-        if let Some(mask) = self
-            .glyphs
-            .lock()
-            .map_err(|_| FontError::LockError)?
-            .get(&key)
-            .cloned()
-        {
+        if let Some(mask) = lock(&self.glyphs).get(&key).cloned() {
             return Ok(mask);
         }
 
@@ -235,14 +261,51 @@ impl FontContext {
             sx_quantum as f32 / SUBPIXEL_LEVELS as f32,
             sy_quantum as f32 / SUBPIXEL_LEVELS as f32,
         );
-        let mask = Arc::new(font.rasterize(glyph_id, size_px, subpixel_offset)?);
-        let mut cache = self.glyphs.lock().map_err(|_| FontError::LockError)?;
-        Ok(cache.entry(key).or_insert(mask).clone())
+        let mask = Arc::new(
+            resolved
+                .font
+                .rasterize(glyph_id, size_px, subpixel_offset)?,
+        );
+        Ok(lock(&self.glyphs).entry(key).or_insert(mask).clone())
     }
 
-    fn resolve(&self, family: FontFamily<'_>, style: FontStyle) -> FontResult<Arc<dyn ParsedFont>> {
+    // The generation the resolution memo must match to be trusted. Only the
+    // legacy registry can invalidate resolutions, so contexts that never look
+    // at it pin the generation to zero.
+    fn registry_generation(&self) -> u64 {
+        #[cfg(feature = "ab_glyph")]
+        if self.include_registered {
+            return super::migration::registry_generation();
+        }
+        0
+    }
+
+    pub(crate) fn resolve(
+        &self,
+        family: FontFamily<'_>,
+        style: FontStyle,
+    ) -> FontResult<ResolvedFont> {
+        let key = (family.as_str().to_owned(), style);
+        let generation = self.registry_generation();
+        {
+            let mut cache = lock(&self.resolved);
+            if cache.generation != generation {
+                cache.map.clear();
+                cache.generation = generation;
+            }
+            if let Some(hit) = cache.map.get(&key) {
+                return Ok(hit.clone());
+            }
+        }
+
         let source = self.resolve_source(family, style)?;
-        self.parse_cached(source.data, source.index)
+        let resolved = parse_cached(source.data, source.index)?;
+
+        let mut cache = lock(&self.resolved);
+        if cache.generation == generation {
+            cache.map.insert(key, resolved.clone());
+        }
+        Ok(resolved)
     }
 
     fn resolve_source(
@@ -256,8 +319,8 @@ impl FontContext {
 
         #[cfg(feature = "ab_glyph")]
         if self.include_registered {
-            if let Some(font) = super::migration::registered_fonts()
-                .and_then(|fonts| find_registered_font(&fonts, family, style).cloned())
+            if let Some(font) =
+                find_registered_font(&super::migration::registered_fonts(), family, style).cloned()
             {
                 return Ok(font);
             }
@@ -275,10 +338,7 @@ impl FontContext {
             });
         }
 
-        let candidate = self
-            .system
-            .lock()
-            .map_err(|_| FontError::LockError)?
+        let candidate = lock(&self.system)
             .resolve(family, style, self.fallback_unresolved_names)
             .ok_or_else(|| FontError::NotInContext {
                 family: family.as_str().to_owned(),
@@ -292,22 +352,30 @@ impl FontContext {
             index: candidate.index,
         })
     }
+}
 
-    fn parse_cached(&self, data: Arc<[u8]>, index: u32) -> FontResult<Arc<dyn ParsedFont>> {
-        let fingerprint = fingerprint(data.as_ref(), index);
-        if let Some(font) = GLOBAL_PARSED
-            .lock()
-            .map_err(|_| FontError::LockError)?
-            .get(&fingerprint)
-            .cloned()
-        {
-            return Ok(font);
-        }
-
-        let parsed = self.engine.parse(data, index)?;
-        let mut global = GLOBAL_PARSED.lock().map_err(|_| FontError::LockError)?;
-        Ok(global.entry(fingerprint).or_insert(parsed).clone())
+fn parse_cached(data: Arc<[u8]>, index: u32) -> FontResult<ResolvedFont> {
+    let fingerprint = fingerprint(data.as_ref(), index);
+    if let Some(font) = lock(&GLOBAL_PARSED)
+        .get(&fingerprint)
+        .and_then(Weak::upgrade)
+    {
+        return Ok(ResolvedFont { font, fingerprint });
     }
+
+    let parsed = harfrust_engine::parse(data, index)?;
+    let mut global = lock(&GLOBAL_PARSED);
+    // A racing thread may have parsed the same bytes while we did; keep the
+    // first entry so both callers share one instance.
+    let font = match global.get(&fingerprint).and_then(Weak::upgrade) {
+        Some(existing) => existing,
+        None => {
+            global.retain(|_, font| font.strong_count() > 0);
+            global.insert(fingerprint, Arc::downgrade(&parsed));
+            parsed
+        }
+    };
+    Ok(ResolvedFont { font, fingerprint })
 }
 
 pub(crate) struct FontContextGuard;
@@ -345,7 +413,6 @@ fn find_registered_font<'a>(
     style: FontStyle,
 ) -> Option<&'a RegisteredFont> {
     let family_str = family.as_str();
-    let style_str = style.as_str();
 
     let mut fallback = None;
 
@@ -353,10 +420,10 @@ fn find_registered_font<'a>(
         if font.family != family_str {
             continue;
         }
-        if font.style.as_str() == style_str {
+        if font.style == style {
             return Some(font);
         }
-        if fallback.is_none() && !matches!(style, FontStyle::Normal) && font.style.as_str() == FontStyle::Normal.as_str() {
+        if fallback.is_none() && style != FontStyle::Normal && font.style == FontStyle::Normal {
             fallback = Some(font);
         }
     }
@@ -397,7 +464,7 @@ mod tests {
     fn explicit_font_resolves_without_system_fonts() {
         let ctx = Arc::new(
             FontContext::new()
-                .with_font("Fixture", FontStyle::Normal, Arc::<[u8]>::from(FONT_BYTES))
+                .with_font("Fixture", FontStyle::Normal, FONT_BYTES)
                 .disable_system_fonts(),
         );
 
@@ -446,14 +513,57 @@ mod tests {
             .resolve(FontFamily::Name("Fixture"), FontStyle::Normal)
             .unwrap();
 
-        assert!(Arc::ptr_eq(&font_a, &font_b));
+        assert!(Arc::ptr_eq(&font_a.font, &font_b.font));
+    }
+
+    #[test]
+    fn resolution_memo_returns_same_font_without_rehashing() {
+        let ctx = Arc::new(
+            FontContext::new()
+                .with_font("Fixture", FontStyle::Normal, FONT_BYTES)
+                .disable_system_fonts(),
+        );
+
+        let first = ctx
+            .resolve(FontFamily::Name("Fixture"), FontStyle::Normal)
+            .unwrap();
+        assert_eq!(lock(&ctx.resolved).map.len(), 1);
+
+        let second = ctx
+            .resolve(FontFamily::Name("Fixture"), FontStyle::Normal)
+            .unwrap();
+        assert!(Arc::ptr_eq(&first.font, &second.font));
+        assert_eq!(lock(&ctx.resolved).map.len(), 1);
+    }
+
+    #[test]
+    fn extended_context_accumulates_fonts() {
+        let base = FontContext::new()
+            .with_font("First", FontStyle::Normal, FONT_BYTES)
+            .disable_system_fonts();
+        let extended = Arc::new(
+            base.extended()
+                .with_font("Second", FontStyle::Normal, FONT_BYTES)
+                .disable_system_fonts(),
+        );
+
+        for family in ["First", "Second"] {
+            extended
+                .resolve(FontFamily::Name(family), FontStyle::Normal)
+                .unwrap();
+        }
+        let err = extended
+            .resolve(FontFamily::Name("Missing"), FontStyle::Normal)
+            .map(|_| ())
+            .unwrap_err();
+        assert!(matches!(err, FontError::NotInContext { .. }));
     }
 
     #[test]
     fn context_stack_pops_when_guard_drops() {
         let ctx = Arc::new(
             FontContext::new()
-                .with_font("Fixture", FontStyle::Normal, Arc::<[u8]>::from(FONT_BYTES))
+                .with_font("Fixture", FontStyle::Normal, FONT_BYTES)
                 .disable_system_fonts(),
         );
 
@@ -469,23 +579,31 @@ mod tests {
     fn glyph_cache_returns_same_arc_for_repeat_calls() {
         let ctx = Arc::new(
             FontContext::new()
-                .with_font("Fixture", FontStyle::Normal, Arc::<[u8]>::from(FONT_BYTES))
+                .with_font("Fixture", FontStyle::Normal, FONT_BYTES)
                 .disable_system_fonts(),
         );
-        let font = ctx
+        let resolved = ctx
             .resolve(FontFamily::Name("Fixture"), FontStyle::Normal)
             .unwrap();
-        let glyph_id = font.shape("A", 24.0).unwrap().glyphs[0].id;
+        let glyph_id = resolved.font.shape("A", 24.0).unwrap().glyphs[0].id;
 
-        let mask_a = ctx.rasterize_cached(&font, glyph_id, 24.0, 0, 0).unwrap();
-        let mask_b = ctx.rasterize_cached(&font, glyph_id, 24.0, 0, 0).unwrap();
+        let mask_a = ctx
+            .rasterize_cached(&resolved, glyph_id, 24.0, 0, 0)
+            .unwrap();
+        let mask_b = ctx
+            .rasterize_cached(&resolved, glyph_id, 24.0, 0, 0)
+            .unwrap();
         assert!(Arc::ptr_eq(&mask_a, &mask_b));
 
-        let mask_c = ctx.rasterize_cached(&font, glyph_id, 36.0, 0, 0).unwrap();
+        let mask_c = ctx
+            .rasterize_cached(&resolved, glyph_id, 36.0, 0, 0)
+            .unwrap();
         assert!(!Arc::ptr_eq(&mask_a, &mask_c));
 
         // Different sub-pixel quanta should produce a distinct entry.
-        let mask_d = ctx.rasterize_cached(&font, glyph_id, 24.0, 2, 0).unwrap();
+        let mask_d = ctx
+            .rasterize_cached(&resolved, glyph_id, 24.0, 2, 0)
+            .unwrap();
         assert!(!Arc::ptr_eq(&mask_a, &mask_d));
     }
 
@@ -510,7 +628,7 @@ mod tests {
     fn context_stack_pops_during_unwind() {
         let ctx = Arc::new(
             FontContext::new()
-                .with_font("Fixture", FontStyle::Normal, Arc::<[u8]>::from(FONT_BYTES))
+                .with_font("Fixture", FontStyle::Normal, FONT_BYTES)
                 .disable_system_fonts(),
         );
 

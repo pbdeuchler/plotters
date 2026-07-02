@@ -1,42 +1,41 @@
-use super::engine::{
-    CoverageMask, FontEngine, FontError, ParsedFont, PositionedGlyph, ShapedRun, Vector2F,
-};
-use harfrust::{Direction, FontRef as HarfrustFontRef, ShaperData, UnicodeBuffer};
+use super::engine::{CoverageMask, FontError, PositionedGlyph, ShapedRun, Vector2F};
+use harfrust::{FontRef as HarfrustFontRef, ShaperData, UnicodeBuffer};
 use skrifa::outline::{
     DrawSettings, Engine, HintingInstance, HintingOptions, OutlineGlyph, OutlinePen,
 };
 use skrifa::prelude::{LocationRef, Size};
 use skrifa::{FontRef as SkrifaFontRef, MetadataProvider};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 // TODO: use glifo (https://github.com/linebender/vello/tree/main/glifo) when it
 // stabilizes
 use zeno::{Command, Mask, PathBuilder};
 
-#[derive(Default)]
-pub struct HarfrustEngine;
+/// Validates the font bytes and builds the shared per-font shaping caches.
+pub(crate) fn parse(data: Arc<[u8]>, index: u32) -> Result<Arc<HarfrustFont>, FontError> {
+    let font = HarfrustFontRef::from_index(data.as_ref(), index)
+        .map_err(|err| FontError::InvalidFontData(err.to_string()))?;
+    SkrifaFontRef::from_index(data.as_ref(), index)
+        .map_err(|err| FontError::InvalidFontData(err.to_string()))?;
+    let shaper_data = ShaperData::new(&font);
 
-impl FontEngine for HarfrustEngine {
-    fn parse(&self, data: Arc<[u8]>, index: u32) -> Result<Arc<dyn ParsedFont>, FontError> {
-        HarfrustFontRef::from_index(data.as_ref(), index)
-            .map_err(|err| FontError::InvalidFontData(err.to_string()))?;
-        SkrifaFontRef::from_index(data.as_ref(), index)
-            .map_err(|err| FontError::InvalidFontData(err.to_string()))?;
-
-        Ok(Arc::new(HarfrustFont {
-            data,
-            index,
-            hinters: Mutex::new(HashMap::new()),
-        }))
-    }
+    Ok(Arc::new(HarfrustFont {
+        data,
+        index,
+        shaper_data,
+        hinters: Mutex::new(HashMap::new()),
+    }))
 }
 
-struct HarfrustFont {
+pub(crate) struct HarfrustFont {
     data: Arc<[u8]>,
     index: u32,
+    // harfrust's per-font shape plans and table caches; built once at parse
+    // time and reused across shape() calls, as harfrust intends.
+    shaper_data: ShaperData,
     // Building a HintingInstance traces the font's TrueType bytecode
     // interpreter; doing it on every rasterize call dwarfs the actual
-    // outline drawing. Cache by quantized pixel size.
+    // outline drawing. Cache by exact pixel size (f32 bit pattern).
     hinters: Mutex<HashMap<u32, Option<Arc<HintingInstance>>>>,
 }
 
@@ -53,7 +52,13 @@ impl HarfrustFont {
 
     fn hinter_for(&self, font_size_px: f32) -> Option<Arc<HintingInstance>> {
         let key = font_size_px.to_bits();
-        if let Some(cached) = self.hinters.lock().ok()?.get(&key).cloned() {
+        if let Some(cached) = self
+            .hinters
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&key)
+            .cloned()
+        {
             return cached;
         }
 
@@ -80,13 +85,14 @@ impl HarfrustFont {
         // are still valid, so cache the miss and fall back at draw time.
         .ok()
         .map(Arc::new);
-        self.hinters.lock().ok()?.insert(key, hinter.clone());
+        self.hinters
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key, hinter.clone());
         hinter
     }
-}
 
-impl ParsedFont for HarfrustFont {
-    fn shape(&self, text: &str, font_size_px: f32) -> Result<ShapedRun, FontError> {
+    pub(crate) fn shape(&self, text: &str, font_size_px: f32) -> Result<ShapedRun, FontError> {
         if text.is_empty() {
             return Ok(ShapedRun {
                 glyphs: Vec::new(),
@@ -95,8 +101,8 @@ impl ParsedFont for HarfrustFont {
         }
 
         let font = self.harfrust_font()?;
-        let shaper_data = ShaperData::new(&font);
-        let shaper = shaper_data
+        let shaper = self
+            .shaper_data
             .shaper(&font)
             .point_size(Some(font_size_px))
             .build();
@@ -104,7 +110,9 @@ impl ParsedFont for HarfrustFont {
 
         let mut buffer = UnicodeBuffer::new();
         buffer.push_str(text);
-        buffer.set_direction(Direction::LeftToRight);
+        // Infer direction and script from the text itself so RTL scripts
+        // shape correctly; harfrust emits glyphs in visual order either way.
+        buffer.guess_segment_properties();
 
         let shaped = shaper.shape(buffer, &[]);
         let infos = shaped.glyph_infos();
@@ -140,7 +148,13 @@ impl ParsedFont for HarfrustFont {
         })
     }
 
-    fn rasterize(
+    /// Rasterize a single glyph at the requested pixel size.
+    ///
+    /// `subpixel_offset` carries the fractional offset of the glyph origin within
+    /// its target pixel cell, in `[0, 1)`. It is folded into the rasterization so
+    /// strokes that fall between integer pixel columns are anti-aliased correctly
+    /// instead of being rounded away.
+    pub(crate) fn rasterize(
         &self,
         glyph_id: u32,
         font_size_px: f32,
@@ -263,8 +277,7 @@ mod tests {
 
     #[test]
     fn shapes_and_rasterizes_fixture_font() {
-        let engine = HarfrustEngine;
-        let font = engine.parse(Arc::<[u8]>::from(FONT_BYTES), 0).unwrap();
+        let font = parse(Arc::<[u8]>::from(FONT_BYTES), 0).unwrap();
 
         let run = font.shape("Hello", 24.0).unwrap();
         assert!(!run.glyphs.is_empty());
@@ -288,8 +301,7 @@ mod tests {
 
     #[test]
     fn subpixel_offset_changes_mask_data() {
-        let engine = HarfrustEngine;
-        let font = engine.parse(Arc::<[u8]>::from(FONT_BYTES), 0).unwrap();
+        let font = parse(Arc::<[u8]>::from(FONT_BYTES), 0).unwrap();
         let glyph_id = font.shape("H", 18.0).unwrap().glyphs[0].id;
 
         let aligned = font
@@ -306,5 +318,13 @@ mod tests {
             && aligned.width == shifted.width
             && aligned.height == shifted.height;
         assert!(!same_placement || aligned.data != shifted.data);
+    }
+
+    #[test]
+    fn parse_rejects_invalid_bytes() {
+        assert!(matches!(
+            parse(Arc::<[u8]>::from(&b"not a font"[..]), 0),
+            Err(FontError::InvalidFontData(_))
+        ));
     }
 }

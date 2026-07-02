@@ -31,6 +31,9 @@ jobs:
         with:
           toolchain: 1.88.0
           override: true
+      - uses: actions-rs/cargo@v1
+        with:
+          command: check
           args: --all-features
   build_and_test:
     runs-on: ${{ matrix.os }}
@@ -71,7 +74,8 @@ jobs:
       - uses: actions-rs/cargo@v1
         with:
           command: test
-          # This is all features except for ab_glyph, which will break doctests
+          # Default features plus every optional feature except ab_glyph,
+          # which disables system fonts and therefore breaks doctests.
           args: --verbose --features=serialization,evcxr
   test_all_features_exclude_doctests:
     runs-on: ubuntu-latest

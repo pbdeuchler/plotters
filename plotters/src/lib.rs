@@ -681,8 +681,8 @@ through `fontique`, shapes text with `harfrust`, reads outlines with `skrifa`,
 and rasterizes glyphs with `zeno`. Use `DrawingArea::with_fonts` when a chart
 should use in-memory fonts instead of, or in addition to, system fonts. See
 [`examples/dynamic_font.rs`](https://github.com/plotters-rs/plotters/blob/master/plotters/examples/dynamic_font.rs)
-for an end-to-end example that downloads Roboto from Google Fonts at runtime
-and attaches it to a chart through the new pipeline.
+for an end-to-end example that attaches bundled Roboto and Kablammo font
+bytes to a chart (and documents how to fetch the same fonts at runtime).
 
 | Name     | Description                                                                       | Additional Dependency | Default? |
 |----------|-----------------------------------------------------------------------------------|-----------------------|----------|
